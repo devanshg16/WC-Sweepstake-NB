@@ -8,6 +8,7 @@ from streamlit_autorefresh import st_autorefresh
 try:
     from google import genai
     from google.genai import errors as core_exceptions
+
 except ImportError:
     genai = None
     core_exceptions = None
@@ -46,6 +47,7 @@ def shorten_name(full_name_str):
     return first_name
 
 API_STAGE_MAP = {
+    "GROUP_STAGE": "Group Stage",
     "ROUND_OF_32": "Round of 32",
     "LAST_32": "Round of 32",
     "ROUND_OF_16": "Round of 16",
@@ -137,10 +139,12 @@ def fetch_live_tournament_data(api_token):
     stats = {}
     stage_matchups = {stage: [] for stage in STAGE_ORDER if stage != "Champion"}
     all_matches = []
+    golden_boot = {}
+    biggest_wins = []
     
     if not api_token or str(api_token).strip() == "":
         st.sidebar.error("⚠️ API Token is missing. Please check your secrets configuration.")
-        return stats, stage_matchups, all_matches
+        return stats, stage_matchups, all_matches, {}, [], []
 
     try:
         headers = {"X-Auth-Token": str(api_token).strip()}
@@ -209,34 +213,79 @@ def fetch_live_tournament_data(api_token):
                                 stats[home_team].setdefault("Live Stages", []).append(current_stage_mapped)
                             if away_team not in ["TBD", "TBC"]:
                                 stats[away_team].setdefault("Live Stages", []).append(current_stage_mapped)
+
+                # Track Golden Boot scorers
+                # Note: Bulk matches API often omits the 'goals' array in standard tiers.
+                # We capture what we can here, but primarily rely on the /scorers endpoint below.
+                match_goals = match.get("goals") or match.get("score", {}).get("goals", [])
+                for goal in match_goals:
+                    s_name = goal.get("scorer", {}).get("name")
+                    g_team = (goal.get("team", {}).get("name") or "Unknown")
+                    if g_team == "United States": g_team = "USA"
+                    if s_name:
+                        if s_name not in golden_boot:
+                            golden_boot[s_name] = {"Scorer": s_name, "Team": g_team, "Goals": 0}
+                        golden_boot[s_name]["Goals"] += 1
                 
-                if status == "FINISHED" and current_stage_mapped and home_team not in ["TBD", "TBC"] and away_team not in ["TBD", "TBC"]:
+                if status == "FINISHED" and (current_stage_mapped or stage == "GROUP_STAGE") and home_team not in ["TBD", "TBC"] and away_team not in ["TBD", "TBC"]:
+                    # Track Biggest Win (Margin and Winner's Goals)
+                    score_data = match.get("score", {})
+                    ft = score_data.get("fullTime", {})
+                    h_g = ft.get("home", 0) or 0
+                    a_g = ft.get("away", 0) or 0
+                    margin = abs(h_g - a_g)
+                    if margin > 0:
+                        biggest_wins.append({
+                            "Match": f"{home_team} vs {away_team}",
+                            "Score": f"{h_g} - {a_g}",
+                            "Margin": margin,
+                            "Goals": max(h_g, a_g),
+                            "Winner": home_team if h_g > a_g else away_team
+                        })
+
                     winner = match.get("score", {}).get("winner")
                     
-                    next_stage = current_stage_mapped
-                    if current_stage_mapped in STAGE_ORDER:
-                        curr_idx = STAGE_ORDER.index(current_stage_mapped)
-                        if curr_idx + 1 < len(STAGE_ORDER):
-                            next_stage = STAGE_ORDER[curr_idx + 1]
+                    # Progress tracking logic (only for knockout stages)
+                    if current_stage_mapped and current_stage_mapped != "Group Stage":
+                        next_stage = current_stage_mapped
+                        if current_stage_mapped in STAGE_ORDER:
+                            curr_idx = STAGE_ORDER.index(current_stage_mapped)
+                            if curr_idx + 1 < len(STAGE_ORDER):
+                                next_stage = STAGE_ORDER[curr_idx + 1]
 
-                    if winner == "HOME_TEAM":
-                        stats[away_team]["Status"] = "Knocked Out"
-                        stats[away_team]["Stage"] = current_stage_mapped
-                        stats[home_team]["Stage"] = next_stage
-                    elif winner == "AWAY_TEAM":
-                        stats[home_team]["Status"] = "Knocked Out"
-                        stats[home_team]["Stage"] = current_stage_mapped
-                        stats[away_team]["Stage"] = next_stage
-            
-                    if stage == "FINAL" and winner:
-                        champ = home_team if winner == "HOME_TEAM" else away_team
-                        stats[champ]["Stage"] = "Champion"
-                        stats[champ]["Status"] = "Winner"
-                        
+                        if winner == "HOME_TEAM":
+                            stats[away_team]["Status"] = "Knocked Out"
+                            stats[away_team]["Stage"] = current_stage_mapped
+                            stats[home_team]["Stage"] = next_stage
+                        elif winner == "AWAY_TEAM":
+                            stats[home_team]["Status"] = "Knocked Out"
+                            stats[home_team]["Stage"] = current_stage_mapped
+                            stats[away_team]["Stage"] = next_stage
+                
+                        if stage == "FINAL" and winner:
+                            champ = home_team if winner == "HOME_TEAM" else away_team
+                            stats[champ]["Stage"] = "Champion"
+                            stats[champ]["Status"] = "Winner"
+
+        # FALLBACK/PRIMARY: Fetch dedicated scorers endpoint to guarantee Golden Boot data
+        scorers_url = "https://api.football-data.org/v4/competitions/WC/scorers"
+        scorers_res = requests.get(scorers_url, headers=headers, timeout=10)
+        if scorers_res.status_code == 200:
+            scorers_data = scorers_res.json().get("scorers", [])
+            for entry in scorers_data:
+                s_name = entry.get("player", {}).get("name")
+                g_team = entry.get("team", {}).get("name") or "Unknown"
+                if g_team == "United States": g_team = "USA"
+                g_count = entry.get("goals", 0)
+                
+                # Update or add to our dictionary
+                if s_name:
+                    golden_boot[s_name] = {"Scorer": s_name, "Team": g_team, "Goals": g_count}
+
     except Exception as e:
         st.sidebar.error(f"API Connection Issue: {e}")
        
-    return stats, stage_matchups, all_matches
+    return stats, stage_matchups, all_matches, golden_boot, biggest_wins
 
 conn = st.connection("gsheets", type=GSheetsConnection)
 
@@ -255,7 +304,7 @@ def database_load_pipeline():
         df_p = df_p.dropna(subset=["Participant Name"])
         
     api_token = st.secrets.get("football_api", {}).get("api_token", "")
-    live_stats, stage_matchups, matches_list = fetch_live_tournament_data(api_token)
+    live_stats, stage_matchups, matches_list, golden_boot, biggest_wins = fetch_live_tournament_data(api_token)
     df_t = pd.DataFrame(list(live_stats.values()))
     
     if df_t.empty:
@@ -301,7 +350,20 @@ def database_load_pipeline():
     else:
         df_t["Player"] = []
         
-    return df_p, df_t, stage_matchups, matches_list, team_to_player
+    df_boot = pd.DataFrame(list(golden_boot.values()))
+    df_wins = pd.DataFrame(biggest_wins)
+    
+    if df_wins.empty:
+        df_wins = pd.DataFrame(columns=["Match", "Score", "Margin", "Goals", "Winner"])
+    else:
+        df_wins = df_wins.sort_values(by=["Margin", "Goals"], ascending=False).reset_index(drop=True)
+
+    if df_boot.empty:
+        df_boot = pd.DataFrame(columns=["Scorer", "Team", "Goals"])
+    else:
+        df_boot = df_boot.sort_values(by="Goals", ascending=False).reset_index(drop=True)
+
+    return df_p, df_t, stage_matchups, matches_list, team_to_player, df_boot, df_wins
 
 def main():
 
@@ -313,7 +375,7 @@ def main():
         st.info(f"Details: {error_msg}")
         st.stop()
 
-    df_participants, df_teams, global_matchups, raw_matches, team_to_player = database_load_pipeline()
+    df_participants, df_teams, global_matchups, raw_matches, team_to_player, df_boot, df_wins = database_load_pipeline()
 
     st.markdown("""
         <style>
@@ -362,7 +424,7 @@ def main():
         ])
         
         with tab_lead:
-            st.subheader("🏆 Global Sweepstake Leaderboard")
+            st.subheader("Overall Standings")
             # Map the combined player names back to the team dataframe directly to avoid row duplicates
             df_lead = df_teams.copy()
             df_lead["Goals Scored"] = df_lead["Goals Scored"].fillna(0).astype(int)
@@ -386,8 +448,32 @@ def main():
                 df_display, 
                 use_container_width=True, 
                 height=450,
-                column_config={"Flag": st.column_config.ImageColumn("🏳️", width="small")}
+                column_config={"Flag": st.column_config.ImageColumn("🏳️", width="small")},
+                hide_index=True
             )
+            
+            st.divider()
+            col_a, col_b = st.columns(2)
+            
+            with col_a:
+                st.subheader("⚽ Golden Boot")
+                # Map the sweepstake owner to the scorer's team
+                df_boot["Owner"] = df_boot["Team"].apply(lambda x: team_to_player.get(str(x).strip().upper(), ""))
+                st.dataframe(df_boot[["Scorer", "Team", "Owner", "Goals"]].head(10), use_container_width=True, hide_index=True)
+                    
+            with col_b:
+                st.subheader("🔥 Biggest Win")
+                df_wins["Owner"] = df_wins["Winner"].apply(lambda x: team_to_player.get(str(x).strip().upper(), ""))
+                st.dataframe(
+                    df_wins[["Winner", "Match", "Score", "Owner"]].head(5), 
+                    use_container_width=True, 
+                    hide_index=True,
+                    column_config={"Owner": "Sweepstake Owner"}
+                )
+
+            st.divider()
+            st.subheader("🚩 Most Corners")
+            st.info("Corner kick statistics are not provided by the current tournament data provider (football-data.org).")
                 
         with tab_bracket:
             st.subheader("Tournament Knockout Progression")
