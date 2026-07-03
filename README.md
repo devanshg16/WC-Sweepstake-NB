@@ -1,1 +1,1 @@
-# WC-Sweepstake-NB
+# WC-Sweepstake
